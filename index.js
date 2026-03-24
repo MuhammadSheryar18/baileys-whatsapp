@@ -1,4 +1,5 @@
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require("@whiskeysockets/baileys");
+const pino = require("pino");
 const express = require("express");
 const QRCode = require("qrcode");
 const app = express();
@@ -18,32 +19,56 @@ function auth(req, res, next) {
 }
 
 async function notifySupabase(path, body) {
-  await fetch(`${SUPABASE_URL}/functions/v1/${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "x-webhook-secret": WEBHOOK_SECRET },
-    body: JSON.stringify(body),
-  });
+  try {
+    await fetch(`${SUPABASE_URL}/functions/v1/${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-webhook-secret": WEBHOOK_SECRET },
+      body: JSON.stringify(body),
+    });
+  } catch (err) {
+    console.error("Supabase notify error:", err.message);
+  }
 }
 
-app.post("/session/start", auth, async (req, res) => {
-  const { tenant_id } = req.body;
-  if (sessions[tenant_id]) return res.json({ status: "already_started" });
-
+async function startSession(tenant_id) {
   const { state, saveCreds } = await useMultiFileAuthState(`./auth_${tenant_id}`);
-  const sock = makeWASocket({ auth: state, printQRInTerminal: true });
+  
+  const sock = makeWASocket({
+    auth: state,
+    printQRInTerminal: true,
+    logger: pino({ level: "warn" }),
+  });
 
-  sessions[tenant_id] = { sock, qr: null };
+  sessions[tenant_id] = { sock, qr: null, status: "connecting" };
 
   sock.ev.on("creds.update", saveCreds);
+  
   sock.ev.on("connection.update", async ({ qr, connection, lastDisconnect }) => {
-    if (qr) sessions[tenant_id].qr = qr;
+    if (qr) {
+      console.log(`[${tenant_id}] QR received`);
+      sessions[tenant_id].qr = qr;
+      sessions[tenant_id].status = "waiting_scan";
+    }
     if (connection === "open") {
+      console.log(`[${tenant_id}] Connected!`);
+      sessions[tenant_id].status = "connected";
+      sessions[tenant_id].qr = null;
       const phone = sock.user?.id?.split(":")[0];
       await notifySupabase("whatsapp-session-update", { tenant_id, status: "connected", phone_number: phone });
     }
     if (connection === "close") {
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      console.log(`[${tenant_id}] Disconnected. Code: ${statusCode}. Reconnect: ${shouldReconnect}`);
+      
       delete sessions[tenant_id];
-      await notifySupabase("whatsapp-session-update", { tenant_id, status: "disconnected" });
+      
+      if (shouldReconnect) {
+        console.log(`[${tenant_id}] Reconnecting...`);
+        setTimeout(() => startSession(tenant_id), 2000);
+      } else {
+        await notifySupabase("whatsapp-session-update", { tenant_id, status: "disconnected" });
+      }
     }
   });
 
@@ -59,20 +84,31 @@ app.post("/session/start", auth, async (req, res) => {
       });
     }
   });
+}
 
-  res.json({ status: "started" });
+app.post("/session/start", auth, async (req, res) => {
+  const { tenant_id } = req.body;
+  if (sessions[tenant_id]) return res.json({ status: "already_started" });
+  
+  try {
+    await startSession(tenant_id);
+    res.json({ status: "started" });
+  } catch (err) {
+    console.error(`[${tenant_id}] Start error:`, err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.get("/session/qr/:tenant_id", auth, async (req, res) => {
   const s = sessions[req.params.tenant_id];
-  if (!s?.qr) return res.json({ qr: null });
+  if (!s?.qr) return res.json({ qr: null, status: s?.status || "inactive" });
   const dataUrl = await QRCode.toDataURL(s.qr);
-  res.json({ qr: dataUrl });
+  res.json({ qr: dataUrl, status: s.status });
 });
 
 app.get("/session/status/:tenant_id", auth, (req, res) => {
   const s = sessions[req.params.tenant_id];
-  res.json({ status: s ? "active" : "inactive" });
+  res.json({ status: s?.status || "inactive" });
 });
 
 app.post("/session/disconnect", auth, (req, res) => {
