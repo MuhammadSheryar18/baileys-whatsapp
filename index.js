@@ -12,6 +12,13 @@ const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "";
 
 const sessions = {};
+const fs = require("fs");
+const path = require("path");
+
+// Clean old corrupted sessions on startup
+const dirs = fs.readdirSync(".").filter(d => d.startsWith("auth_"));
+dirs.forEach(d => fs.rmSync(d, { recursive: true, force: true }));
+console.log(`Cleaned ${dirs.length} old session(s)`);
 
 function auth(req, res, next) {
   if (WEBHOOK_SECRET && req.headers["x-webhook-secret"] !== WEBHOOK_SECRET) {
