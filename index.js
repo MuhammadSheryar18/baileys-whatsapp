@@ -1,4 +1,4 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, makeCacheableSignalKeyStore } = require("@whiskeysockets/baileys");
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require("@whiskeysockets/baileys");
 const pino = require("pino");
 const express = require("express");
 const QRCode = require("qrcode");
@@ -12,13 +12,14 @@ const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "";
 
 const sessions = {};
-const fs = require("fs");
-const path = require("path");
 
-// Clean old corrupted sessions on startup
-const dirs = fs.readdirSync(".").filter(d => d.startsWith("auth_"));
-dirs.forEach(d => fs.rmSync(d, { recursive: true, force: true }));
-console.log(`Cleaned ${dirs.length} old session(s)`);
+try {
+  const dirs = fs.readdirSync(".").filter(d => d.startsWith("auth_"));
+  dirs.forEach(d => fs.rmSync(d, { recursive: true, force: true }));
+  console.log("Cleaned", dirs.length, "old session(s)");
+} catch(e) {
+  console.log("No sessions to clean");
+}
 
 function auth(req, res, next) {
   if (WEBHOOK_SECRET && req.headers["x-webhook-secret"] !== WEBHOOK_SECRET) {
@@ -29,7 +30,7 @@ function auth(req, res, next) {
 
 async function notifySupabase(path, body) {
   try {
-    const res = await fetch(`${SUPABASE_URL}/functions/v1/${path}`, {
+    await fetch(`${SUPABASE_URL}/functions/v1/${path}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -38,7 +39,6 @@ async function notifySupabase(path, body) {
       },
       body: JSON.stringify(body),
     });
-    console.log(`Notified ${path}: ${res.status}`);
   } catch (err) {
     console.error("Supabase notify error:", err.message);
   }
@@ -47,23 +47,14 @@ async function notifySupabase(path, body) {
 async function startSession(tenant_id) {
   const authDir = `./auth_${tenant_id}`;
   if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true });
-
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
-
   const sock = makeWASocket({
-    auth: {
-      creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "silent" })),
-    },
+    auth: state,
     logger: pino({ level: "silent" }),
     browser: ["WA2GHL", "Chrome", "1.0.0"],
-    generateHighQualityLinkPreview: false,
   });
-
   sessions[tenant_id] = { sock, qr: null, status: "connecting" };
-
   sock.ev.on("creds.update", saveCreds);
-
   sock.ev.on("connection.update", async ({ qr, connection, lastDisconnect }) => {
     if (qr) {
       console.log(`[${tenant_id}] QR received`);
@@ -75,11 +66,7 @@ async function startSession(tenant_id) {
       sessions[tenant_id].status = "connected";
       sessions[tenant_id].qr = null;
       const phone = sock.user?.id?.split(":")[0];
-      await notifySupabase("whatsapp-session-update", {
-        tenant_id,
-        status: "connected",
-        phone_number: phone,
-      });
+      await notifySupabase("whatsapp-session-update", { tenant_id, status: "connected", phone_number: phone });
     }
     if (connection === "close") {
       const statusCode = lastDisconnect?.error?.output?.statusCode;
@@ -87,26 +74,17 @@ async function startSession(tenant_id) {
       console.log(`[${tenant_id}] Disconnected. Code: ${statusCode}. Reconnect: ${shouldReconnect}`);
       delete sessions[tenant_id];
       if (shouldReconnect) {
-        console.log(`[${tenant_id}] Reconnecting in 3s...`);
-        setTimeout(() => startSession(tenant_id), 3000);
+        setTimeout(() => startSession(tenant_id), 5000);
       } else {
-        await notifySupabase("whatsapp-session-update", {
-          tenant_id,
-          status: "disconnected",
-        });
+        await notifySupabase("whatsapp-session-update", { tenant_id, status: "disconnected" });
       }
     }
   });
-
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
     for (const msg of messages) {
       if (msg.key.fromMe || !msg.message) continue;
-      const text =
-        msg.message.conversation ||
-        msg.message.extendedTextMessage?.text ||
-        msg.message.imageMessage?.caption ||
-        "";
+      const text = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
       if (!text) continue;
       await notifySupabase("whatsapp-inbound", {
         tenant_id,
@@ -117,8 +95,6 @@ async function startSession(tenant_id) {
       });
     }
   });
-
-  return sock;
 }
 
 app.get("/health", (req, res) => res.json({ status: "ok" }));
@@ -131,7 +107,6 @@ app.post("/session/start", auth, async (req, res) => {
     await startSession(tenant_id);
     res.json({ status: "started" });
   } catch (err) {
-    console.error(`[${tenant_id}] Start error:`, err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -153,14 +128,13 @@ app.get("/session/status/:tenant_id", auth, (req, res) => {
   res.json({ status: s?.status || "inactive" });
 });
 
-app.post("/session/disconnect", auth, async (req, res) => {
+app.post("/session/disconnect", auth, (req, res) => {
   const { tenant_id } = req.body;
   if (sessions[tenant_id]) {
-    try { sessions[tenant_id].sock.end(); } catch (e) {}
+    try { sessions[tenant_id].sock.end(); } catch(e) {}
     delete sessions[tenant_id];
   }
   res.json({ status: "disconnected" });
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Baileys server running on port ${PORT}`));
+app.listen(process.env.PORT || 3000, () => console.log("Baileys server running"));
